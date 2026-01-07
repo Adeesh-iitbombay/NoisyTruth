@@ -39,18 +39,20 @@ class UKF:
         self.sigmas = self.__get_sigmas()
         self.lock = Lock()
 
-    def __get_sigmas(self):
-        ret = np.zeros((self.n_dim, self.n_sig))
+  def __get_sigmas(self):
+    # Use Cholesky for stability
+    try:
+        # L @ L.T = P
+        L = np.linalg.cholesky((self.n_dim + self.lambd) * self.p)
+    except np.linalg.LinAlgError:
+        # Fallback or jitter addition if P is not positive-definite
+        raise UKFException("Covariance matrix is not positive-definite")
 
-        sqrt_mat = scipy.linalg.sqrtm((self.n_dim + self.lambd) * self.p)
-
-        ret[:, 0] = self.x.flatten()
-
-        for i in range(self.n_dim):
-            ret[:, i + 1] = self.x.flatten() + sqrt_mat[:, i]
-            ret[:, i + 1 + self.n_dim] = self.x.flatten() - sqrt_mat[:, i]
-
-        return ret
+    sigmas = np.zeros((self.n_dim, self.n_sig))
+    sigmas[:, 0] = self.x.flatten()
+    sigmas[:, 1:self.n_dim+1] = self.x + L
+    sigmas[:, self.n_dim+1:] = self.x - L
+    return sigmas
 
     def predict(self, timestep, inputs=[]):
         self.lock.acquire()
