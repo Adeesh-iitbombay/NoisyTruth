@@ -1,152 +1,154 @@
 import numpy as np
-import matplotlib.pyplot as plt
+import scipy.linalg
+from ukf import UKF
+from scipy.spatial.transform import Rotation
 
 
-# =====================================================
-# CONSTANT VELOCITY PROCESS MODEL
-# =====================================================
-def constant_velocity_model(state, dt, inputs=None):
+# ==========================================================
+# AUV PROCESS MODEL (USED BY UKF)
+# ==========================================================
+def auv_process_model(state, dt, u):
     """
-    State = [x, y, z, vx, vy, vz]
+    State:
+    [x, y, z, roll, pitch, yaw, u, v, w]
+
+    Input u:
+    [p, q, r, ax, ay, az]  (IMU)
     """
-    x, y, z, vx, vy, vz = state
 
-    x += vx * dt
-    y += vy * dt
-    z += vz * dt
+    # Unpack state
+    x, y, z, roll, pitch, yaw, u_b, v_b, w_b = state
+    p, q, r, ax, ay, az = u
 
-    return np.array([x, y, z, vx, vy, vz])
+    g = 9.81  # gravity (NED, positive down)
 
+    # --------------------------------------------------
+    # 1. Orientation propagation (Euler integration)
+    # --------------------------------------------------
+    roll  += p * dt
+    pitch += q * dt
+    yaw   += r * dt
 
-# =====================================================
-# MINIMAL UKF IMPLEMENTATION (EDUCATIONAL)
-# =====================================================
-class UKF:
-    def __init__(self, num_states, Q, init_state, init_covar,
-                 alpha, kappa, beta, process_model):
-        self.n = num_states
-        self.Q = Q
-        self.x = init_state
-        self.P = init_covar
-        self.fx = process_model
+    # --------------------------------------------------
+    # 2. Velocity propagation (body frame)
+    # --------------------------------------------------
+    R = Rotation.from_euler("XYZ", [roll, pitch, yaw]).as_matrix()
 
-        self.alpha = alpha
-        self.kappa = kappa
-        self.beta = beta
+    # gravity expressed in body frame
+    g_body = R.T @ np.array([0.0, 0.0, g])
 
-        self.lambda_ = alpha**2 * (self.n + kappa) - self.n
-        self.gamma = np.sqrt(self.n + self.lambda_)
+    u_b += (ax - g_body[0]) * dt
+    v_b += (ay - g_body[1]) * dt
+    w_b += (az - g_body[2]) * dt
 
-        self.Wm = np.full(2*self.n+1, 1/(2*(self.n+self.lambda_)))
-        self.Wc = self.Wm.copy()
-        self.Wm[0] = self.lambda_ / (self.n + self.lambda_)
-        self.Wc[0] = self.Wm[0] + (1 - alpha**2 + beta)
+    # --------------------------------------------------
+    # 3. Position propagation (world frame)
+    # --------------------------------------------------
+    v_world = R @ np.array([u_b, v_b, w_b])
 
-    def sigma_points(self):
-        sqrtP = np.linalg.cholesky(self.P)
-        sigmas = [self.x]
-        for i in range(self.n):
-            sigmas.append(self.x + self.gamma * sqrtP[:, i])
-            sigmas.append(self.x - self.gamma * sqrtP[:, i])
-        return np.array(sigmas)
+    x += v_world[0] * dt
+    y += v_world[1] * dt
+    z += v_world[2] * dt
 
-    def predict(self, dt):
-        sigmas = self.sigma_points()
-        sigmas_f = np.array([self.fx(s, dt) for s in sigmas])
-
-        self.x = np.sum(self.Wm[:, None] * sigmas_f, axis=0)
-
-        self.P = self.Q.copy()
-        for i in range(len(sigmas_f)):
-            diff = sigmas_f[i] - self.x
-            self.P += self.Wc[i] * np.outer(diff, diff)
-
-    def update(self, states, data, r_matrix):
-        sigmas = self.sigma_points()
-        z_sigmas = sigmas[:, states]
-
-        z_pred = np.sum(self.Wm[:, None] * z_sigmas, axis=0)
-
-        S = r_matrix.copy()
-        Pxz = np.zeros((self.n, len(states)))
-
-        for i in range(len(sigmas)):
-            dz = z_sigmas[i] - z_pred
-            dx = sigmas[i] - self.x
-            S += self.Wc[i] * np.outer(dz, dz)
-            Pxz += self.Wc[i] * np.outer(dx, dz)
-
-        K = Pxz @ np.linalg.inv(S)
-        innovation = np.array(data) - z_pred
-
-        self.x += K @ innovation
-        self.P -= K @ S @ K.T
-
-    def get_state(self):
-        return self.x.copy()
+    return np.array([x, y, z, roll, pitch, yaw, u_b, v_b, w_b])
 
 
-# =====================================================
+# ==========================================================
+# MEASUREMENT MODELS
+# ==========================================================
+def h_dvl(state):
+    """DVL measures body-frame velocity"""
+    return state[6:9]
+
+
+def h_pressure(state):
+    """Pressure sensor measures depth (z)"""
+    return np.array([state[2]])
+
+
+# ==========================================================
 # LOCALIZATION RUNNER
-# =====================================================
-def run_localization(filename):
-    num_states = 6
-    Q = np.eye(num_states) * 0.05
-    init_state = np.zeros(num_states)
-    init_covar = np.eye(num_states)
+# ==========================================================
+def run_localization(data_stream):
+    """
+    data_stream: iterable of dicts with keys:
+    {
+        't': timestamp,
+        'imu': [p, q, r, ax, ay, az],
+        'dvl': [u, v, w] or None,
+        'pressure': depth or None
+    }
+    """
 
-    ukf = UKF(num_states, Q, init_state, init_covar,
-              alpha=0.3, kappa=0.0, beta=2.0,
-              process_model=constant_velocity_model)
+    # -------------------------------
+    # UKF initialization
+    # -------------------------------
+    n = 9
 
-    last_time = None
-    results = []
+    Q = np.diag([
+        0.01, 0.01, 0.01,     # position
+        0.001, 0.001, 0.001,  # orientation
+        0.05, 0.05, 0.05     # velocity
+    ])
 
-    with open(filename, 'r') as f:
-        for line in f:
-            if not line.strip():
-                continue
+    x0 = np.zeros(n)
+    P0 = np.eye(n) * 0.5
 
-            parts = line.strip().split(',')
-            timestamp = float(parts[0])
-            sensor = parts[1].strip().upper()
+    ukf = UKF(
+        num_states=n,
+        process_noise=Q,
+        initial_state=x0,
+        initial_covar=P0,
+        alpha=0.3,
+        kappa=0.0,
+        beta=2.0
+    )
 
-            if last_time is None:
-                last_time = timestamp
-                continue
+    R_dvl = np.diag([0.05, 0.05, 0.05])
+    R_ps = np.array([[0.1]])
 
-            dt = timestamp - last_time
-            if dt <= 0:
-                continue
-            last_time = timestamp
+    last_t = None
+    trajectory = []
 
-            ukf.predict(dt)
+    # -------------------------------
+    # Main loop
+    # -------------------------------
+    for entry in data_stream:
+        t = entry["t"]
 
-            if sensor == 'DEPTH':
-                z = float(parts[2])
-                ukf.update([2], [z], np.eye(1) * 0.5)
+        if last_t is None:
+            last_t = t
+            continue
 
-            elif sensor == 'GPS':
-                x = float(parts[2])
-                y = float(parts[3])
-                ukf.update([0, 1], [x, y], np.eye(2) * 2.0)
+        dt = t - last_t
+        if dt <= 0:
+            continue
+        last_t = t
 
-            state = ukf.get_state()
-            results.append([timestamp, state[0], state[1], state[2]])
+        # -------- Prediction --------
+        ukf.predict(
+            f=auv_process_model,
+            dt=dt,
+            u=entry["imu"]
+        )
 
-    return np.array(results)
+        # -------- DVL update --------
+        if entry["dvl"] is not None:
+            ukf.update(
+                z=entry["dvl"],
+                h=h_dvl,
+                R=R_dvl
+            )
 
+        # -------- Pressure update --------
+        if entry["pressure"] is not None:
+            ukf.update(
+                z=[entry["pressure"]],
+                h=h_pressure,
+                R=R_ps
+            )
 
-# =====================================================
-# MAIN
-# =====================================================
-if __name__ == "__main__":
-    data = run_localization("sensor_data.txt")
+        state = ukf.get_state().flatten()
+        trajectory.append([t, state[0], state[1], state[2]])
 
-    plt.figure()
-    plt.plot(data[:, 0], data[:, 3], label="Filtered Depth")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Depth (m)")
-    plt.legend()
-    plt.grid()
-    plt.show()
+    return np.array(trajectory)
