@@ -6,7 +6,6 @@ from rclpy.node import Node
 from scipy.spatial.transform import Rotation
 
 from sensor_msgs.msg import Imu
-from std_msgs.msg import String
 from std_srvs.srv import Empty
 from auv_msgs.msg import DVLVel, PsData, AuvState
 from auv_localization.ukf import UKF
@@ -20,160 +19,164 @@ class Localization(Node):
         # ===============================
         # PARAMETERS
         # ===============================
-        self.declare_parameter('dt', 0.1)
-        self.declare_parameter('use_ukf', True)
         self.declare_parameter('debug', False)
-
-        self.dt = self.get_parameter('dt').value
-        self.use_ukf = self.get_parameter('use_ukf').value
         self.debug = self.get_parameter('debug').value
 
         # ===============================
-        # STATE STORAGE
+        # STATE & INPUT STORAGE
         # ===============================
-        self.imu_data = None          # [roll, pitch, yaw, p, q, r, ax, ay, az]
-        self.dvl_velocity = None      # [u, v, w]
-        self.depth = None
+        self.imu_input = None      # [p, q, r, ax, ay, az]  (NED, body)
+        self.dvl_meas = None       # [u, v, w]             (body)
+        self.depth_meas = None     # z (down)
 
+        self.last_imu_time = None
         self.origin_yaw = 0.0
         self.initialized = False
 
         # ===============================
         # ROS INTERFACES
         # ===============================
-        self.sub_imu = self.create_subscription(Imu, '/imu/data', self.cb_imu, 10)
-        self.sub_dvl = self.create_subscription(DVLVel, '/dvl/velData', self.cb_dvl, 10)
-        self.sub_ps = self.create_subscription(PsData, '/ps/data', self.cb_ps, 10)
+        self.create_subscription(Imu, '/imu/data', self.cb_imu, 20)
+        self.create_subscription(DVLVel, '/dvl/velData', self.cb_dvl, 10)
+        self.create_subscription(PsData, '/ps/data', self.cb_ps, 10)
 
         self.pub_state = self.create_publisher(AuvState, '/localization/pose', 10)
-        self.reset_srv = self.create_service(Empty, '/localization/reset', self.cb_reset)
-
-        self.timer = self.create_timer(self.dt, self.run)
+        self.create_service(Empty, '/localization/reset', self.cb_reset)
 
         # ===============================
         # UKF INITIALIZATION
         # ===============================
         self.init_ukf()
 
-        self.get_logger().info("Localization node started")
+        self.get_logger().info("Localization node initialized")
 
     # ======================================================
     # UKF SETUP
     # ======================================================
     def init_ukf(self):
-        n = 9
+        n = 9  # [x,y,z, roll,pitch,yaw, u,v,w]
 
-        initial_state = np.zeros(n)
-        initial_cov = np.diag([1, 1, 1, 0.1, 0.1, 0.1, 0.5, 0.5, 0.5])
+        x0 = np.zeros(n)
+        P0 = np.diag([1, 1, 1, 0.1, 0.1, 0.1, 0.5, 0.5, 0.5])
 
-        Q = np.diag([0.01]*3 + [0.001]*3 + [0.05]*3)
+        Q = np.diag([
+            0.01, 0.01, 0.01,
+            0.001, 0.001, 0.001,
+            0.05, 0.05, 0.05
+        ])
+
         self.R_dvl = np.diag([0.05, 0.05, 0.05])
         self.R_depth = np.array([[0.1]])
 
         self.ukf = UKF(
             num_states=n,
             process_noise=Q,
-            initial_state=initial_state,
-            initial_covar=initial_cov,
+            initial_state=x0,
+            initial_covar=P0,
             alpha=0.3,
             beta=2.0,
             k=0.0,
-            iterate_function=self.motion_model
+            iterate_function=self.process_model
         )
 
     # ======================================================
     # CALLBACKS
     # ======================================================
     def cb_imu(self, msg: Imu):
-        rot = Rotation.from_quat([
-            msg.orientation.x,
-            msg.orientation.y,
-            msg.orientation.z,
-            msg.orientation.w
-        ])
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        # Convert ENU → NED
-        roll, pitch, yaw = rot.as_euler('XYZ', degrees=False)
-        roll, pitch = roll, -pitch
-        yaw = -yaw
+        # Angular velocity ENU → NED
+        p = msg.angular_velocity.x
+        q = -msg.angular_velocity.y
+        r = -msg.angular_velocity.z
 
-        self.imu_data = np.array([
-            roll, pitch, yaw,
-            msg.angular_velocity.x,
-            msg.angular_velocity.y,
-            msg.angular_velocity.z,
-            msg.linear_acceleration.x,
-            msg.linear_acceleration.y,
-            msg.linear_acceleration.z
-        ])
+        # Linear acceleration ENU → NED
+        ax = msg.linear_acceleration.x
+        ay = -msg.linear_acceleration.y
+        az = -msg.linear_acceleration.z
+
+        self.imu_input = np.array([p, q, r, ax, ay, az])
+
+        if self.last_imu_time is None:
+            self.last_imu_time = t
+            return
+
+        dt = t - self.last_imu_time
+        self.last_imu_time = t
+
+        if dt <= 0 or not self.initialized:
+            return
+
+        # ---------- UKF PREDICT ----------
+        self.ukf.predict(dt, self.imu_input)
+
+        # ---------- MEASUREMENT UPDATES ----------
+        if self.dvl_meas is not None:
+            self.ukf.update([6, 7, 8], self.dvl_meas, self.R_dvl)
+
+        if self.depth_meas is not None:
+            self.ukf.update([2], [self.depth_meas], self.R_depth)
+
+        self.publish_state()
 
     def cb_dvl(self, msg: DVLVel):
-        self.dvl_velocity = np.array([
+        self.dvl_meas = np.array([
             msg.velocity.x,
             msg.velocity.y,
             msg.velocity.z
         ])
 
     def cb_ps(self, msg: PsData):
-        self.depth = msg.depth
+        self.depth_meas = msg.depth
+
+        if not self.initialized:
+            state = self.ukf.get_state()
+            state[2] = self.depth_meas
+            self.ukf.reset(state, self.ukf.get_covariance())
+            self.initialized = True
+            self.get_logger().info("Localization initialized")
 
     def cb_reset(self, req, res):
         self.origin_yaw = self.ukf.get_state()[5]
-        self.get_logger().info("Localization reset")
+        self.get_logger().info("Localization yaw reset")
         return res
 
     # ======================================================
-    # MOTION MODEL (UKF fx)
+    # PROCESS MODEL
     # ======================================================
-    def motion_model(self, state, dt, inputs):
-        x, y, z, roll, pitch, yaw, u, v, w = state
-        p, q, r, ax, ay, az = inputs
+    def process_model(self, state, dt, u):
+        x, y, z, roll, pitch, yaw, u_b, v_b, w_b = state
+        p, q, r, ax, ay, az = u
 
         g = 9.81
 
-        # --- Orientation ---
-        roll += p * dt
+        # Orientation
+        roll  += p * dt
         pitch += q * dt
-        yaw += r * dt
+        yaw   += r * dt
 
-        # --- Velocity (gravity compensated) ---
         R = Rotation.from_euler('XYZ', [roll, pitch, yaw]).as_matrix()
+
         g_body = R.T @ np.array([0, 0, g])
 
-        u += (ax - g_body[0]) * dt
-        v += (ay - g_body[1]) * dt
-        w += (az - g_body[2]) * dt
+        u_b += (ax - g_body[0]) * dt
+        v_b += (ay - g_body[1]) * dt
+        w_b += (az - g_body[2]) * dt
 
-        # --- Position ---
-        vel_world = R @ np.array([u, v, w])
+        vel_world = R @ np.array([u_b, v_b, w_b])
+
         x += vel_world[0] * dt
         y += vel_world[1] * dt
         z += vel_world[2] * dt
 
-        return np.array([x, y, z, roll, pitch, yaw, u, v, w])
+        return np.array([x, y, z, roll, pitch, yaw, u_b, v_b, w_b])
 
     # ======================================================
-    # MAIN LOOP
+    # PUBLISH
     # ======================================================
-    def run(self):
-        if self.imu_data is None or self.dvl_velocity is None or self.depth is None:
-            return
+    def publish_state(self):
+        s = self.ukf.get_state()
 
-        if self.use_ukf:
-            self.ukf.predict(self.dt, self.imu_data[3:9])
-            self.ukf.update([6, 7, 8], self.dvl_velocity, self.R_dvl)
-            self.ukf.update([2], [self.depth], self.R_depth)
-
-            state = self.ukf.get_state()
-        else:
-            state = np.zeros(9)
-
-        self.publish_state(state)
-
-    # ======================================================
-    # PUBLISH STATE
-    # ======================================================
-    def publish_state(self, s):
         msg = AuvState()
         msg.header.stamp = self.get_clock().now().to_msg()
 
